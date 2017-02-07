@@ -1,0 +1,35 @@
+server-side in guest:
+
+stdafx.h
+
+    common data structures
+
+agent.c
+    main_loop function
+    
+list.c
+    window list
+    
+queue.c
+    event queue
+    
+memctl.c
+    kernel memory read & write
+    wrappers for manapulating physical contiguous memory
+    
+com.c
+    communicate with client and supervisor
+    send_close_notify()
+    receive_event()
+    //hotplug_sock()
+    hyper_copy()
+    hyper_paste()
+
+win.c
+    enum_all_windows()
+    get_parent_window()
+    print_window()
+    
+event.c
+    emulate_event()
+

@@ -1,0 +1,3 @@
+cp kmem.ko /lib/
+
+/sbin/insmod /lib/kmem.ko

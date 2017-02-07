@@ -1,0 +1,24 @@
+qemu:
+
+sudo apt-get install libtool autoconf
+
+./configure --target-list=x86_64-softmmu
+
+client-linux:
+
+sudo cp memalloc.ko /sys/module
+
+server-linux:
+sudo apt-get install xorg-dev kvm
+
+qemu-img
+qcow2
+
+/boot 150MB
+/tmp 512MB
+/srv 128MB
+/opt 512MB
+/usr 4GB
+
+
+

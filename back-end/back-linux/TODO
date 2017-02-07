@@ -1,0 +1,5 @@
+在getimage中又再次对窗口的属性进行检索。没有必要。一开始就可以将poph和frame分开。把override标识符给记上。
+
+send_notify会阻塞实现。
+
+charcode 和 button合并union。

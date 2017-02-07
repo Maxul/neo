@@ -1,0 +1,450 @@
+diff -Nur qemu-kvm-1.2.0/configure qemu-kvmOS-1.2.0/configure
+--- qemu-kvm-1.2.0/configure	2012-09-06 16:31:27.000000000 +0800
++++ qemu-kvmOS-1.2.0/configure	2017-01-13 13:16:44.931096000 +0800
+@@ -289,7 +289,7 @@
+ QEMU_CFLAGS="-fno-strict-aliasing $QEMU_CFLAGS"
+ QEMU_CFLAGS="-Wall -Wundef -Wwrite-strings -Wmissing-prototypes $QEMU_CFLAGS"
+ QEMU_CFLAGS="-Wstrict-prototypes -Wredundant-decls $QEMU_CFLAGS"
+-QEMU_CFLAGS="-D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE $QEMU_CFLAGS"
++QEMU_CFLAGS="-D_VMOS -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE $QEMU_CFLAGS"
+ QEMU_INCLUDES="-I. -I\$(SRC_PATH) -I\$(SRC_PATH)/fpu"
+ if test "$debug_info" = "yes"; then
+     CFLAGS="-g $CFLAGS"
+@@ -2682,13 +2682,18 @@
+ cat > $TMPC <<EOF
+ #include <signal.h>
+ #include <time.h>
+-int main(void) { return clock_gettime(CLOCK_REALTIME, NULL); }
++int main(void) {
++  timer_create(CLOCK_REALTIME, NULL, NULL);
++  return clock_gettime(CLOCK_REALTIME, NULL);
++}
+ EOF
+ 
+ if compile_prog "" "" ; then
+   :
+-elif compile_prog "" "-lrt" ; then
++#elif compile_prog "" "-lrt" ; then
++elif compile_prog "" "-lrt $pthread_lib" ; then
+   LIBS="-lrt $LIBS"
++  libs_qga="-lrt $libs_qga"
+ fi
+ 
+ if test "$darwin" != "yes" -a "$mingw32" != "yes" -a "$solaris" != yes -a \
+diff -Nur qemu-kvm-1.2.0/exec.c qemu-kvmOS-1.2.0/exec.c
+--- qemu-kvm-1.2.0/exec.c	2012-09-06 16:31:27.000000000 +0800
++++ qemu-kvmOS-1.2.0/exec.c	2017-02-07 19:51:44.441025781 +0800
+@@ -2525,6 +2525,15 @@
+     }
+ }
+ 
++extern ram_addr_t gpa;
++
++#define VMOS_SHM
++#ifdef VMOS_SHM
++#include <sys/ipc.h>
++#include <sys/shm.h>
++extern const char *hdb_arg;
++#endif
++
+ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                    MemoryRegion *mr)
+ {
+@@ -2535,6 +2544,17 @@
+ 
+     new_block->mr = mr;
+     new_block->offset = find_ram_offset(size);
++    
++#ifdef VMOS_SHM
++    if (!gpa) {
++        int shm = shmget(ftok(hdb_arg, 0xff), size, IPC_CREAT | 0600);
++        if (shm == -1) exit(9);
++        new_block->host = shmat(shm, NULL, 0);
++        gpa = (ram_addr_t)new_block->host;
++        memset((void *)gpa, 0, size);
++    } else
++#endif
++    
+     if (host) {
+         new_block->host = host;
+         new_block->flags |= RAM_PREALLOC_MASK;
+@@ -2577,6 +2597,11 @@
+     if (kvm_enabled())
+         kvm_setup_guest_memory(new_block->host, size);
+ 
++#ifndef VMOS_SHM
++    if (!gpa)
++        gpa = (ram_addr_t)new_block->host;
++#endif
++
+     return new_block->offset;
+ }
+
+diff -Nur qemu-kvm-1.2.0/vl.c qemu-kvmOS-1.2.0/vl.c
+--- qemu-kvm-1.2.0/vl.c	2012-09-06 16:31:27.000000000 +0800
++++ qemu-kvmOS-1.2.0/vl.c	2017-02-07 20:15:48.858966415 +0800
+@@ -2342,6 +2342,329 @@
+     return main_loop_init();
+ }
+ 
++/* VMOS edited by Ecular */
++//#define _VMOS
++
++#include <pthread.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <semaphore.h>
++#include <sys/types.h>
++#include <sys/ipc.h>
++#include <sys/shm.h>
++#include <sys/stat.h>
++#include <sys/sem.h>
++
++#include "qemu-thread.h"
++
++#ifdef _VMOS
++
++#define SHARED_MEM_SIZE ((1<<20)*5) //5MB
++#define KMEM_SIZE (1<<22) // 4MB
++#define SUPERVISOR_PORT (18888)
++
++#ifdef _VMOS
++#define DBGprintf printf
++#else
++#define DBGprintf
++#endif
++
++#define DBGExit(fmt) { DBGprintf(fmt); exit(EXIT_FAILURE); }
++#define DBGError(err) { perror(err); exit(EXIT_FAILURE); }
++
++#define Int sizeof(int)
++
++#define MAGIC "TRUST"
++
++#define EVENT_FLAG 0X8
++#define WIN_FLAG 0x9
++#define CLOSE_FLAG 0Xa
++#define CMD_FLAG 0xb
++
++static QemuThread tid_shm;
++static QemuThread tid_cmd;
++
++ram_addr_t gpa = 0;
++const char *hdb_arg;
++
++static int flag_appvm = 0;
++static long long unsigned int gpa_off = 0; /* should be uint64_t both in QEMU and Guest Driver */
++
++static int sem_id_close;
++
++static int sem_id;
++static int shm_id;
++static char *shm_addr; /* points to the shared memory*/
++
++union semun {
++    int val;
++    unsigned short *array;
++    struct semid_ds *buf;
++} sem_union;
++    
++static int semOpen(int sem_id)
++{
++    sem_union.val = 1;
++    if (semctl(sem_id, 0, SETVAL, sem_union) == -1)
++    {
++        DBGprintf("semOpen failed\n");
++        return 0;
++    }
++    return 1;
++}
++
++static int semClose(int sem_id)
++{
++    if (semctl(sem_id, 0, IPC_RMID, sem_union) == -1)
++    {
++        DBGprintf("semClose failed\n");
++        return 0;
++    }
++    return 1;
++}
++
++static int semLock(int sem_id)
++{
++    struct sembuf sem_b;
++
++    sem_b.sem_num = 0;
++    sem_b.sem_op = -1;
++    sem_b.sem_flg = SEM_UNDO;
++
++    if (semop(sem_id, &sem_b, 1) == -1)
++    {
++        DBGprintf("semLock failed\n");
++        return 0;
++    }
++    return 1;
++}
++
++static int semUnlock(int sem_id)
++{
++    struct sembuf sem_b;
++
++    sem_b.sem_num = 0;
++    sem_b.sem_op = 1;
++    sem_b.sem_flg = SEM_UNDO;
++
++    if (semop(sem_id, &sem_b, 1) == -1)
++    {
++        DBGprintf("semUnlock failed\n");
++        return 0;
++    }
++    return 1;
++}
++
++/* thread for command receiving on socket by Ecular */
++static void *cmd_recv(void *unused)
++{
++    int server_fd, client_fd;
++    struct sockaddr_in server, client;
++    socklen_t sin_size;
++    int rev_len;
++    int portnum = (int)ftok(hdb_arg, ~0);
++    char buf[128];
++
++    server_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (-1 == server_fd)
++        DBGExit("socket fail !\n");
++
++    bzero(&server,sizeof(struct sockaddr_in));
++    server.sin_family = AF_INET;
++    server.sin_addr.s_addr = htonl(INADDR_ANY);
++    server.sin_port = htons(portnum);
++
++    if (-1 == bind(server_fd,(struct sockaddr *)(&server), sizeof(struct sockaddr)))
++        DBGExit("bind fail !\n");
++
++    if (-1 == listen(server_fd, 5))
++        DBGExit("listen fail !\n");
++
++    for (;;)
++    {
++        sin_size = sizeof(struct sockaddr_in);
++        client_fd = accept(server_fd, (struct sockaddr *)(&client), &sin_size);
++        if (-1 == client_fd)
++            DBGExit("accept fail !\n");
++
++        if ( (rev_len=recv(client_fd, buf, sizeof(buf), 0)) == -1 )
++            DBGError("call to recv");
++
++        DBGprintf("User Command: \"%s\"\n", buf);
++
++        *(int64_t *)(gpa + 1 + 0xff) = rev_len;
++        memcpy((void *)(gpa + 1 + 0xff + sizeof(int64_t)), buf, rev_len);
++        *(char *)(gpa + 0xff) = '1';
++
++        bzero(buf, sizeof(buf));
++        close(client_fd);
++        sleep(1);
++    }
++
++    close(server_fd);
++    return NULL;
++}
++#if 0
++static void register_to_supervisor(void)
++{
++    const char *magic_number = MAGIC; /* VMOS randomly chosen */
++
++    char vmname[32];
++    char connect_notify[64];
++
++    int cfd = socket(AF_INET, SOCK_STREAM, 0);
++    if (-1 == cfd)
++        DBGExit("socket fail ! \n");
++
++    struct sockaddr_in s_add;
++    bzero(&s_add, sizeof(struct sockaddr_in));
++    s_add.sin_family = AF_INET;
++    s_add.sin_addr.s_addr = inet_addr("127.0.0.1");
++    s_add.sin_port = htons(SUPERVISOR_PORT);
++
++    if (-1 == connect(cfd, (struct sockaddr *)(&s_add), sizeof(struct sockaddr)))
++        DBGExit("connect to supervisor fail !\n");
++
++    if (strrchr(hdb_arg,'/'))
++        memcpy(vmname,strrchr(hdb_arg,'/')+1,strrchr(hdb_arg,'.')-strrchr(hdb_arg,'/') - 1);
++    else
++        memcpy(vmname,strrchr(hdb_arg,'-')+1,strrchr(hdb_arg,'.')-strrchr(hdb_arg,'-') - 1);
++
++    strcat(connect_notify, magic_number);
++    strcat(connect_notify, vmname);
++    send_all(cfd, connect_notify, strlen(connect_notify));
++}
++#endif
++static void allocate_shared_memory(void)
++{
++    /* calculate key using '-hdb' argument */
++    key_t key = ftok(hdb_arg, 0xf);
++    if (key == -1)
++        DBGError("ftok error");
++
++    sem_id = semget(key, 1, IPC_CREAT | 0600);
++    if (!semOpen(sem_id))
++        DBGExit("Failed to initialize semaphore\n");
++
++    /* create shared memory segment with this key */
++    shm_id = shmget(key, SHARED_MEM_SIZE, IPC_CREAT | 0600);
++    if (-1 == shm_id)
++        DBGError("shmget error");
++
++    /* attach this segment to its address space */
++    shm_addr = (char *)shmat(shm_id, NULL, 0);
++    if ((void *)-1 == shm_addr)
++        DBGError("shmget error");
++
++    /* initialize it */
++    bzero(shm_addr, SHARED_MEM_SIZE);
++    *(char *)(shm_addr + 1) = '0';
++}
++
++static void locate_kernel_memory(void)
++{
++    /* waiting for Virtual Physical Address to be ready */
++    DBGprintf("Seeking kernel memory .");
++    while (0 != memcmp((void *)gpa, MAGIC, sizeof(MAGIC))) {
++        sleep(2);
++        DBGprintf(" .");
++        fflush(stdout);
++    }
++    
++    /* Obtain VirtPhyAddr written by Guest Driver */
++    gpa_off = *(long long unsigned int *)(gpa + 0x10);
++    DBGprintf("\nLocated at 0x%llx\n", gpa_off);
++}
++
++/* thread operating the shared memory */
++static void *shm_op(void *arg)
++{
++    /* First of all, we are to establish our identity to supervisor for ID check. */
++    //register_to_supervisor();
++
++    /* Then we have prepared a shared memory and semaphore
++        to operate it with server correctly, */
++    /* hdb --> key --> shm && sem */
++    allocate_shared_memory();
++    locate_kernel_memory();
++
++    /* Fork a thread in order to receive commands */
++    qemu_thread_create(&tid_cmd, cmd_recv, NULL, QEMU_THREAD_DETACHED);
++    
++    /* Inform Guest Agent that QEMU has found the Address */
++    *(char *)(gpa + gpa_off + 1) = '0';
++    
++    for (;;) {
++        /* found an event from server */
++        semLock(sem_id);
++        char *shm_event = (char *)(shm_addr);
++        if ('0' <= *shm_event && *shm_event <= '9') {
++            typedef struct {
++                int64_t x, y, button, source_wid;
++                char event_type;
++            } Item;
++            memcpy((void *)(gpa + 200), shm_addr + KMEM_SIZE + 20, sizeof(Item));
++
++            /* a new event has occurred */
++            *(char *)(gpa + 8) = *shm_event;
++
++            /* if loop count >=1000 then break and ignore this event*/
++            int eventloop_count = 0;
++            for (;;) {
++                ++eventloop_count;
++                /* client has recieved event or otherwise ignore this event */
++                if (*(char *)(gpa + 8) == '-' || eventloop_count >= 1000) {
++                    /* discard this event */
++                    *shm_event = '-';
++                    break;
++                }
++            }
++        }
++        semUnlock(sem_id);
++        /* 虽然是连续操作，但是不建议去掉这个锁，否则会影响反应实时性 */
++
++        /* send guest info to server */
++        semLock(sem_id);
++        /* client has image to send && server has received previous data */
++        if (*(char *)(gpa + gpa_off + 1) == '1' && *(char *)(shm_addr + 1) == '0') {
++            /* Clear shared memory */
++            memset((void *)(shm_addr + 1), 0, KMEM_SIZE);
++            /* Copy GHA(4MB) to shared memory region */
++            memcpy((void *)(shm_addr + 1), (void *)(gpa + gpa_off + 1), KMEM_SIZE);
++
++            /* Tell server that QEMU has sent */
++            *(char *)(shm_addr + SHARED_MEM_SIZE - 0xf) = 'Y';
++            /* Tell client that QEMU has copied */
++            *(char *)(gpa + gpa_off + 1) = '0';
++            
++            static long long unsigned i = 0;
++            DBGprintf("Copy Image to Shared Memory.%llx\n", i++);
++        }
++        semUnlock(sem_id);
++
++        /* inside Close Notify */
++        if('1' == *((char *)(gpa + 10))) { /* new notify coming */
++            for (;;) {
++                if( *((char *)(shm_addr+KMEM_SIZE + Int)) == '0' )
++                    break;
++                usleep(10000);
++            }
++
++            semLock(sem_id);
++            *((int *)(shm_addr+KMEM_SIZE + Int + 1)) = *((int *)(gpa + 11));
++            *((char *)(shm_addr+KMEM_SIZE + Int)) = '1';
++            semUnlock(sem_id);
++
++            *((char *)(gpa + 10)) = '0';
++            DBGprintf("Guest WinID: 0x%x to be closed!\n", *((int *)(gpa + 11)));
++        }
++        // NO SLEEP -> the key to accelerate!!!
++    }
++    return NULL;
++}
++#endif /* _VMOS */
++
+ int main(int argc, char **argv, char **envp)
+ {
+     int i;
+@@ -2491,6 +2814,18 @@
+                     break;
+                 }
+             case QEMU_OPTION_hdb:
++            
++#ifdef _VMOS /* <Xu Jian> at 2013.11.21 */
++            hdb_arg = optarg;
++            sem_id_close = semget(ftok(optarg, 0x03), 1, 0666 | IPC_CREAT);
++            if(!semOpen(sem_id_close)) {
++                fprintf(stderr, "Failed to initialize semaphore\n");
++                exit(EXIT_FAILURE);
++            }
++            semLock(sem_id_close);
++            flag_appvm = 1;
++#endif /* _VMOS */
++            
+             case QEMU_OPTION_hdc:
+             case QEMU_OPTION_hdd:
+                 drive_add(IF_DEFAULT, popt->index - QEMU_OPTION_hda, optarg,
+@@ -3787,7 +4122,15 @@
+     os_setup_post();
+ 
+     resume_all_vcpus();
++    
++#ifdef _VMOS
++    if(1 == flag_appvm)
++        qemu_thread_create(&tid_shm, shm_op, NULL, QEMU_THREAD_DETACHED);
++    main_loop();
++#else
+     main_loop();
++#endif /* _VMOS */
++
+     bdrv_close_all();
+     pause_all_vcpus();
+     net_cleanup();

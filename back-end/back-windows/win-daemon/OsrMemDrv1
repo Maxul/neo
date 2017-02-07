@@ -1,0 +1,729 @@
+#include <ntddk.h>
+
+#define OSRMEMDRV_LEVEL_VERBOSE 1
+
+#define FILE_DEVICE_OSRMEMDRV 0xCF53
+#define OSR_MEMORY_SIZE 32
+
+#define IOCTL_OSR_SETSHAREMEM \
+	CTL_CODE(FILE_DEVICE_OSRMEMDRV, 2049, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_OSR_GETMEM \
+	CTL_CODE(FILE_DEVICE_OSRMEMDRV, 2050, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _myMem
+{
+	CHAR content[OSR_MEMORY_SIZE];
+} myMem, *PmyMem;
+
+typedef struct _USER_MEMORY_ADDRESS
+{
+	PVOID   UserMemoryAddress;
+} USER_MEMORY_ADDRESS, *PUSER_MEMORY_ADDRESS;
+
+
+typedef struct _MEM_USER_ENTRY
+{
+	LIST_ENTRY      ListEntry;
+	PFILE_OBJECT    FileObject;         // File Object of queuer
+	PVOID           UserVaToReturn;     // Mapped VA for the process
+	PMDL            PMdl;               // MDL used to map memory
+	PIRP            Irp;                // If a hanging IRP was used.
+
+} MEM_USER_ENTRY, *PMEM_USER_ENTRY;
+
+typedef struct _OSRMEMDRV_DEV_EXT
+{
+	PDEVICE_OBJECT		DeviceObject;
+	FAST_MUTEX      MemUserListMutex;
+	LIST_ENTRY      MemUserList;
+
+	FAST_MUTEX      IrpQueueMutex;
+	LIST_ENTRY      IrpQueue;
+
+} OSRMEMDRV_DEVICE_EXT, *POSRMEMDRV_DEVICE_EXT;
+
+
+// 入口
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObj, PUNICODE_STRING RegistryPath);
+
+NTSTATUS OsrMemDrvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS OsrMemDrvCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS OsrMemDrvClose(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS OsrMemDrvCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
+NTSTATUS OsrMemDrvWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS OsrMemDrvRead(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
+VOID     OsrMemDrvUnload(PDRIVER_OBJECT DriverObject);
+
+NTSTATUS CreateAndMapMemory(PMDL* PMemMdl, PVOID* UserVa);
+void     UnMapAndFreeMemory(PMDL PMdl, PVOID UserVa);
+VOID     CancelSetShareMemRoutine(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  DriverEntry
+//
+///////////////////////////////////////////////////////////////////////////////
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObj, PUNICODE_STRING RegistryPath)
+{
+	NTSTATUS                code;
+	POSRMEMDRV_DEVICE_EXT   devExt;
+	PDEVICE_OBJECT          devObj;
+	UNICODE_STRING          devName, linkName;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE,
+		"\nOSR OSRMEMDRV Driver -- Compiled %s %s\n", __DATE__, __TIME__);
+
+	DriverObj->MajorFunction[IRP_MJ_CREATE] = OsrMemDrvCreate;
+	DriverObj->MajorFunction[IRP_MJ_CLOSE] = OsrMemDrvClose;
+	DriverObj->MajorFunction[IRP_MJ_CLEANUP] = OsrMemDrvCleanup;
+
+	DriverObj->MajorFunction[IRP_MJ_READ] = OsrMemDrvRead;
+	DriverObj->MajorFunction[IRP_MJ_WRITE] = OsrMemDrvWrite;
+	DriverObj->MajorFunction[IRP_MJ_DEVICE_CONTROL] = OsrMemDrvDeviceControl;
+
+	DriverObj->DriverUnload = OsrMemDrvUnload;
+
+	RtlInitUnicodeString(&devName, L"\\Device\\OsrMemDrv");
+
+	code = IoCreateDevice(
+		DriverObj,
+		sizeof(OSRMEMDRV_DEVICE_EXT),
+		&devName,
+		FILE_DEVICE_OSRMEMDRV,
+		FILE_DEVICE_SECURE_OPEN,
+		FALSE,
+		&devObj);
+
+	if (!NT_SUCCESS(code))  {
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE,
+			"IoCreateDevice failed.  Status = 0x%0x\n", code);
+		return(STATUS_UNSUCCESSFUL);
+	}
+
+	// 设备扩展获取额外内存
+	devExt = (POSRMEMDRV_DEVICE_EXT)devObj->DeviceExtension;
+	devExt->DeviceObject = devObj; // 存以备用
+
+	//  Initialize MemUserList information.
+	ExInitializeFastMutex(&devExt->MemUserListMutex);
+	InitializeListHead(&devExt->MemUserList);
+
+	//  Initialize IrpQueue information.
+	ExInitializeFastMutex(&devExt->IrpQueueMutex);
+	InitializeListHead(&devExt->IrpQueue);
+
+	// 保证设备在用户态下可以访问，创建符号链接
+	RtlInitUnicodeString(&linkName, L"\\??\\OsrMemDrv");
+
+	code = IoCreateSymbolicLink(&linkName, &devName);
+
+	if (!NT_SUCCESS(code)) {
+		IoDeleteDevice(devObj);
+
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE,
+			"IoCreateSymbolicLink failed.  Status = 0x%x\n", code);
+		return(code);
+	}
+
+	// 我们需要用于读写的MDLS
+	devObj->Flags |= DO_DIRECT_IO;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE,
+		"OsrMemDrvDriverEntry: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvCreate
+//
+//    我们申请一块连续内存提供用户以文件读写形式访问，
+//    用户调用IOCTL_OSR_GETMEM时可以得到共享内存指针。
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PIO_STACK_LOCATION      ioStackLocation = IoGetCurrentIrpStackLocation(Irp);
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	PMEM_USER_ENTRY         pEntry = NULL;
+	NTSTATUS                status = STATUS_SUCCESS;
+	BOOLEAN                 bFound = FALSE;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvCreate: Starting now\n");
+
+	// Lock access to our list of memory that was allocated per create call.
+	ExAcquireFastMutex(&devExt->MemUserListMutex);
+
+	// Allocate an entry from paged pool, since we only access this memory at IRQL < DISPATCH_LEVEL.
+	//pEntry = (PMEM_USER_ENTRY)ExAllocatePoolWithTag(PagedPool, sizeof(MEM_USER_ENTRY), 'eumP');
+	PHYSICAL_ADDRESS phyHiAddr, MemPhyAddr;		// 物理地址
+	phyHiAddr.QuadPart = 0xFFFFFFFFFFFFFFFF;	// 最大的可用的物理地址
+
+	if ((pEntry = (PMEM_USER_ENTRY)MmAllocateContiguousMemory(sizeof(myMem), phyHiAddr)) != NULL)							// 虚拟地址分配成功
+	{
+		MemPhyAddr = MmGetPhysicalAddress(pEntry); // 返回虚拟地址对应的物理地址
+	}
+	KdPrint(("分配内核连续空间地址为：%0X", MemPhyAddr.QuadPart));
+	KdPrint(("分配内核连续空间大小为：%u", sizeof(myMem)));
+	memset(pEntry, 0xf, sizeof(myMem));
+
+	if (!pEntry) {
+		status = STATUS_INSUFFICIENT_RESOURCES;
+	}
+	else {
+		// 保证将内存映射到调用此创建操作的进程（线程）空间当中
+		if (PsGetCurrentThread() == Irp->Tail.Overlay.Thread) {
+			status = CreateAndMapMemory(&pEntry->PMdl, &pEntry->UserVaToReturn);
+			if (NT_SUCCESS(status)) {
+				pEntry->FileObject = ioStackLocation->FileObject;
+				InsertTailList(&devExt->MemUserList, &pEntry->ListEntry);
+			}
+			else {
+				//ExFreePool(pEntry);
+				MmFreeContiguousMemory(pEntry);
+			}
+		}
+		else {
+			// 不在正确的上下文中
+			//ExFreePool(pEntry);
+			MmFreeContiguousMemory(pEntry);
+			status = STATUS_ACCESS_DENIED;
+		}
+	}
+	// Release access to the list.
+	ExReleaseFastMutex(&devExt->MemUserListMutex);
+
+	Irp->IoStatus.Status = status;
+	Irp->IoStatus.Information = 0;
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvCreate: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvClose
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvClose: Starting\n");
+
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+	Irp->IoStatus.Information = 0;
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvClose: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvCleanup
+//
+//    必须对所有共享内存进行释放
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PIO_STACK_LOCATION      ioStackLocation = IoGetCurrentIrpStackLocation(Irp);
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	PMEM_USER_ENTRY         pEntry = NULL;
+	NTSTATUS                status = STATUS_SUCCESS;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvCleanup: Starting\n");
+
+	ExAcquireFastMutex(&devExt->MemUserListMutex);
+
+	if (!IsListEmpty(&devExt->MemUserList)) {
+
+		PLIST_ENTRY pLentry;
+		for (pLentry = devExt->MemUserList.Flink; pLentry != &devExt->MemUserList; pLentry = pLentry->Flink) {
+			pEntry = (PMEM_USER_ENTRY)pLentry;
+			if (pEntry->FileObject == ioStackLocation->FileObject) {
+
+				RemoveEntryList(&pEntry->ListEntry);
+				UnMapAndFreeMemory(pEntry->PMdl, pEntry->UserVaToReturn);
+				//ExFreePool(pEntry);
+				MmFreeContiguousMemory(pEntry);
+				break;
+			}
+		}
+	}
+	// Release access to the list.
+	ExReleaseFastMutex(&devExt->MemUserListMutex);
+
+	// Gain access to the IRP queue....
+	ExAcquireFastMutex(&devExt->IrpQueueMutex);
+
+	// See if there are any hanging IOCTL_OSR_SETSHAREMEM Irps.
+	if (!IsListEmpty(&devExt->IrpQueue)) {
+		PLIST_ENTRY pLentry;
+		for (pLentry = devExt->IrpQueue.Flink; pLentry != &devExt->IrpQueue; pLentry = pLentry->Flink) {
+			pEntry = (PMEM_USER_ENTRY)pLentry;
+			if (pEntry->FileObject == ioStackLocation->FileObject) {
+
+				RemoveEntryList(&pEntry->ListEntry);
+				IoSetCancelRoutine(pEntry->Irp, NULL);
+				pEntry->Irp->IoStatus.Status = STATUS_SUCCESS;
+				pEntry->Irp->IoStatus.Information = 0;
+				IoCompleteRequest(pEntry->Irp, IO_NO_INCREMENT);
+				//ExFreePool(pEntry);
+				MmFreeContiguousMemory(pEntry);
+				break;
+			}
+		}
+	}
+	// Release access to the Irp Queue.
+	ExReleaseFastMutex(&devExt->IrpQueueMutex);
+
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+	Irp->IoStatus.Information = 0;
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvCleanup: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvWrite
+//
+//    我们在设备中设置了DO_DIRECT_IO位，
+//    传入的数据均位于未分页的缓冲池中，
+//    通过Irp->MdlAddress访问。
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PIO_STACK_LOCATION      ioStack = IoGetCurrentIrpStackLocation(Irp);
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	BOOLEAN                 bFound = FALSE;
+	PMEM_USER_ENTRY         pEntry;
+	NTSTATUS                status = STATUS_INVALID_PARAMETER;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvWrite: Starting\n");
+
+	if (!Irp->MdlAddress || ioStack->Parameters.Write.Length < sizeof(OSR_MEMORY_SIZE)) {
+		status = STATUS_INVALID_PARAMETER;
+	}
+	else {
+		ExAcquireFastMutex(&devExt->IrpQueueMutex);
+
+		if (!IsListEmpty(&devExt->IrpQueue)) {
+			PLIST_ENTRY pLentry;
+			for (pLentry = devExt->IrpQueue.Flink; pLentry != &devExt->IrpQueue; pLentry = pLentry->Flink) {
+				pEntry = (PMEM_USER_ENTRY)pLentry;
+				if (pEntry->FileObject == ioStack->FileObject) {
+					bFound = TRUE;
+
+					// 获取源、汇缓冲的虚拟地址并复制数据，否则返回错误。
+					PUCHAR pDestChar = (PUCHAR)MmGetSystemAddressForMdlSafe(pEntry->Irp->MdlAddress, NormalPagePriority);
+					PUCHAR pSrcChar = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+					if (pDestChar && pSrcChar) {
+						memcpy(pDestChar, pSrcChar, OSR_MEMORY_SIZE);
+					}
+					else {
+						status = STATUS_INSUFFICIENT_RESOURCES;
+					}
+					break;
+				}
+			}
+		}
+
+		ExReleaseFastMutex(&devExt->IrpQueueMutex);
+		if (!bFound) {
+			ExAcquireFastMutex(&devExt->MemUserListMutex);
+			if (!IsListEmpty(&devExt->MemUserList)) {
+				PLIST_ENTRY pLentry;
+				for (pLentry = devExt->MemUserList.Flink; pLentry != &devExt->MemUserList; pLentry = pLentry->Flink) {
+					pEntry = (PMEM_USER_ENTRY)pLentry;
+					if (pEntry->FileObject == ioStack->FileObject) {
+						bFound = TRUE;
+
+						PUCHAR pDestChar = (PUCHAR)MmGetSystemAddressForMdlSafe(pEntry->PMdl, NormalPagePriority);
+						PUCHAR pSrcChar = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+						if (pDestChar && pSrcChar) {
+							memcpy(pDestChar, pSrcChar, OSR_MEMORY_SIZE);
+						}
+						else {
+							status = STATUS_INSUFFICIENT_RESOURCES;
+						}
+						break;
+					}
+				}
+			}
+			ExReleaseFastMutex(&devExt->MemUserListMutex);
+		}
+	}
+
+	Irp->IoStatus.Status = status;
+	if (NT_SUCCESS(status)) {
+		Irp->IoStatus.Information = OSR_MEMORY_SIZE;
+	}
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvWrite: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvRead
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PIO_STACK_LOCATION      ioStack = IoGetCurrentIrpStackLocation(Irp);
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	BOOLEAN                 bFound = FALSE;
+	PMEM_USER_ENTRY         pEntry;
+	NTSTATUS                status = STATUS_INVALID_PARAMETER;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvRead: Starting\n");
+
+	// 检查输入参数。
+	if (!Irp->MdlAddress || ioStack->Parameters.Read.Length < sizeof(OSR_MEMORY_SIZE)) {
+		status = STATUS_INVALID_PARAMETER;
+	}
+	else {
+		ExAcquireFastMutex(&devExt->IrpQueueMutex);
+		if (!IsListEmpty(&devExt->IrpQueue)) {
+			PLIST_ENTRY pLentry;
+			for (pLentry = devExt->IrpQueue.Flink; pLentry != &devExt->IrpQueue; pLentry = pLentry->Flink) {
+				pEntry = (PMEM_USER_ENTRY)pLentry;
+				if (pEntry->FileObject == ioStack->FileObject) {
+					bFound = TRUE;
+					PUCHAR pSrcChar = (PUCHAR)MmGetSystemAddressForMdlSafe(pEntry->Irp->MdlAddress, NormalPagePriority);
+					PUCHAR pDestChar = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+					if (pDestChar && pSrcChar) {
+						memcpy(pDestChar, pSrcChar, OSR_MEMORY_SIZE);
+					}
+					else {
+						status = STATUS_INSUFFICIENT_RESOURCES;
+					}
+					break;
+				}
+			}
+		}
+
+		ExReleaseFastMutex(&devExt->IrpQueueMutex);
+
+		if (!bFound) {
+			ExAcquireFastMutex(&devExt->MemUserListMutex);
+			if (!IsListEmpty(&devExt->MemUserList)) {
+				PLIST_ENTRY pLentry;
+				for (pLentry = devExt->MemUserList.Flink; pLentry != &devExt->MemUserList; pLentry = pLentry->Flink) {
+					pEntry = (PMEM_USER_ENTRY)pLentry;
+					if (pEntry->FileObject == ioStack->FileObject) {
+						bFound = TRUE;
+						PUCHAR pSrcChar = (PUCHAR)MmGetSystemAddressForMdlSafe(pEntry->PMdl, NormalPagePriority);
+						PUCHAR pDestChar = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+						if (pDestChar && pSrcChar) {
+							memcpy(pDestChar, pSrcChar, OSR_MEMORY_SIZE);
+						}
+						else {
+							status = STATUS_INSUFFICIENT_RESOURCES;
+						}
+						break;
+					}
+				}
+			}
+			ExReleaseFastMutex(&devExt->MemUserListMutex);
+		}
+	}
+
+	Irp->IoStatus.Status = status;
+	if (status == STATUS_SUCCESS) {
+		Irp->IoStatus.Information = OSR_MEMORY_SIZE;
+	}
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvRead: Leaving\n");
+
+	return(STATUS_SUCCESS);
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvDeviceControl
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS OsrMemDrvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	PIO_STACK_LOCATION      ioStack = IoGetCurrentIrpStackLocation(Irp);
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	NTSTATUS                status = STATUS_INVALID_PARAMETER;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvDeviceControl: Starting\n");
+
+	switch (ioStack->Parameters.DeviceIoControl.IoControlCode) {
+
+	case IOCTL_OSR_SETSHAREMEM: {
+		BOOLEAN bFound = FALSE;
+		status = STATUS_SUCCESS;
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvDeviceControl: IOCTL_OSR_OSRMEMDRV processed\n");
+		ExAcquireFastMutex(&devExt->IrpQueueMutex);
+		if (!IsListEmpty(&devExt->IrpQueue)) {
+			PLIST_ENTRY pLentry;
+			PMEM_USER_ENTRY pEntry;
+			for (pLentry = devExt->IrpQueue.Flink; pLentry != &devExt->IrpQueue; pLentry = pLentry->Flink) {
+				pEntry = (PMEM_USER_ENTRY)pLentry;
+				if (pEntry->FileObject == ioStack->FileObject) {
+					status = STATUS_ACCESS_DENIED;
+					bFound = TRUE;
+					break;
+				}
+			}
+		}
+		if (!bFound) {
+			if (PsGetCurrentThread() == Irp->Tail.Overlay.Thread) {
+				//PMEM_USER_ENTRY pEntry = (PMEM_USER_ENTRY)ExAllocatePoolWithTag(PagedPool, sizeof(MEM_USER_ENTRY), 'eumI');
+				PMEM_USER_ENTRY pEntry;
+				PHYSICAL_ADDRESS phyHiAddr, MemPhyAddr;		// 物理地址
+				phyHiAddr.QuadPart = 0xFFFFFFFFFFFFFFFF;	// 最大的可用的物理地址
+
+				if ((pEntry = (PMEM_USER_ENTRY)MmAllocateContiguousMemory(sizeof(myMem), phyHiAddr)) != NULL)							// 虚拟地址分配成功
+				{
+					MemPhyAddr = MmGetPhysicalAddress(pEntry); // 返回虚拟地址对应的物理地址
+				}
+				KdPrint(("分配内核连续空间地址为：%0X", MemPhyAddr.QuadPart));
+				KdPrint(("分配内核连续空间大小为：%u", sizeof(myMem)));
+				memset(pEntry, 0xa, sizeof(myMem));
+
+				if (pEntry) {
+					pEntry->FileObject = ioStack->FileObject;
+					pEntry->Irp = Irp;
+					IoMarkIrpPending(Irp);
+					IoSetCancelRoutine(Irp, CancelSetShareMemRoutine);
+					InsertTailList(&devExt->IrpQueue, &pEntry->ListEntry);
+					ExReleaseFastMutex(&devExt->IrpQueueMutex);
+					return STATUS_PENDING;
+				}
+				else {
+					status = STATUS_INSUFFICIENT_RESOURCES;
+				}
+			}
+			else {
+				status = STATUS_ACCESS_DENIED;
+			}
+		}
+		ExReleaseFastMutex(&devExt->IrpQueueMutex);
+	}
+								break;
+
+	case IOCTL_OSR_GETMEM: {
+		PMEM_USER_ENTRY pEntry = NULL;
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE,
+			"OsrMemDrvDeviceControl: IOCTL_OSR_GETMEM processed\n");
+
+		ExAcquireFastMutex(&devExt->MemUserListMutex);
+
+		if (!IsListEmpty(&devExt->MemUserList)) {
+			PLIST_ENTRY pLentry;
+			BOOLEAN     bFound = FALSE;
+			status = STATUS_INVALID_PARAMETER;
+			for (pLentry = devExt->MemUserList.Flink; pLentry != &devExt->MemUserList; pLentry = pLentry->Flink) {
+				pEntry = (PMEM_USER_ENTRY)pLentry;
+				if (pEntry->FileObject == ioStack->FileObject) {
+					if (!Irp->AssociatedIrp.SystemBuffer || ioStack->Parameters.DeviceIoControl.OutputBufferLength <
+						sizeof(USER_MEMORY_ADDRESS)) {
+						status = STATUS_BUFFER_OVERFLOW;
+						Irp->IoStatus.Information = sizeof(USER_MEMORY_ADDRESS);
+					}
+					else {
+						PUSER_MEMORY_ADDRESS pUMA = (PUSER_MEMORY_ADDRESS)Irp->AssociatedIrp.SystemBuffer;
+						pUMA->UserMemoryAddress = pEntry->UserVaToReturn;
+						status = STATUS_SUCCESS;
+						Irp->IoStatus.Information = sizeof(USER_MEMORY_ADDRESS);
+					}
+					break;
+				}
+			}
+		}
+		else {
+			status = STATUS_INVALID_PARAMETER;
+		}
+		ExReleaseFastMutex(&devExt->MemUserListMutex);
+	}
+						   break;
+
+	default:
+		status = STATUS_INVALID_PARAMETER;
+
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvDeviceControl: Invalid IOCTL code\n");
+
+		break;
+	}
+
+	Irp->IoStatus.Status = status;
+	Irp->IoStatus.Information = 0;
+
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvDeviceControl: Leaving\n");
+
+	return(status);
+}
+
+
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  OsrMemDrvUnload
+//
+//    我们有义务释放向系统申请的所有资源。
+//
+///////////////////////////////////////////////////////////////////////////////
+static VOID OsrMemDrvUnload(PDRIVER_OBJECT DriverObject)
+{
+	PDEVICE_OBJECT devObj;
+	UNICODE_STRING linkName;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvUnload: Starting\n");
+
+	devObj = DriverObject->DeviceObject;
+
+	if (!devObj) {
+
+		return;
+	}
+
+	RtlInitUnicodeString(&linkName, L"\\??\\OsrMemDrv");
+
+	IoDeleteSymbolicLink(&linkName);
+	IoDeleteDevice(devObj);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, OSRMEMDRV_LEVEL_VERBOSE, "OsrMemDrvUnload: Leaving\n");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  CancelSetShareMemRoutine
+//
+//    This routine is our cancel routine for a queued IOCTL_OSR_SETSHAREMEM 
+//    DeviceIoControl Irp.
+//
+///////////////////////////////////////////////////////////////////////////////
+VOID CancelSetShareMemRoutine(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
+{
+	POSRMEMDRV_DEVICE_EXT   devExt = (POSRMEMDRV_DEVICE_EXT)DeviceObject->DeviceExtension;
+	PLIST_ENTRY             pLentry;
+	PMEM_USER_ENTRY         pEntry;
+
+	// Release the Cancel SpinLock, we don't use it.
+	IoReleaseCancelSpinLock(Irp->CancelIrql);
+
+	// Gain access to the IrpQueue.
+	ExAcquireFastMutex(&devExt->IrpQueueMutex);
+
+	// Search the queue looking for the canceled IRP.
+	for (pLentry = devExt->IrpQueue.Flink; pLentry != &devExt->IrpQueue; pLentry = pLentry->Flink) {
+		pEntry = (PMEM_USER_ENTRY)pLentry;
+		if (pEntry->Irp == Irp) {
+			RemoveEntryList(&pEntry->ListEntry);
+			IoSetCancelRoutine(pEntry->Irp, NULL);
+			pEntry->Irp->IoStatus.Status = STATUS_CANCELLED;
+			pEntry->Irp->IoStatus.Information = 0;
+			IoCompleteRequest(pEntry->Irp, IO_NO_INCREMENT);
+			//ExFreePool(pEntry);
+			MmFreeContiguousMemory(pEntry);
+			break;
+		}
+	}
+
+	ExReleaseFastMutex(&devExt->IrpQueueMutex);
+
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  CreateAndMapMemory
+//
+//  NOTES:
+//
+//      We had better be running in the process where we want this 
+//      memory mapped. 最好把内存映射到我们想要的进程当中。
+//
+///////////////////////////////////////////////////////////////////////////////
+NTSTATUS CreateAndMapMemory(PMDL* PMemMdl, PVOID* UserVa)
+{
+	PMDL                mdl;
+	PVOID               userVAToReturn;
+	PHYSICAL_ADDRESS    lowAddress;
+	PHYSICAL_ADDRESS    highAddress;
+	SIZE_T              totalBytes;
+
+	lowAddress.QuadPart = 0;
+	highAddress.QuadPart = 0xFFFFFFFFFFFFFFFF; // 4*16=64位
+	totalBytes = OSR_MEMORY_SIZE;
+
+	mdl = MmAllocatePagesForMdl(lowAddress, highAddress, lowAddress, totalBytes);
+
+	if (!mdl) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	// 将缓存映射到用户空间
+	userVAToReturn = MmMapLockedPagesSpecifyCache(mdl,          // MDL
+		UserMode,     // Mode
+		MmCached,     // Caching
+		NULL,         // Address
+		FALSE,        // Bugcheck?
+		NormalPagePriority); // Priority
+
+	if (!userVAToReturn)  {
+		MmFreePagesFromMdl(mdl);
+		IoFreeMdl(mdl);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	*UserVa = userVAToReturn;
+	*PMemMdl = mdl;
+	
+	return STATUS_SUCCESS;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//
+//  UnMapAndFreeMemory
+//
+//    用于释放进程和驱动程序的共享内存空间。
+//
+//  INPUTS:
+//
+//      PMdl   - 内存描述符
+//      UserVa - 共享内存基址
+//
+///////////////////////////////////////////////////////////////////////////////
+void UnMapAndFreeMemory(PMDL PMdl, PVOID UserVa)
+{
+	if (!PMdl) {
+		return;
+	}
+
+	MmUnmapLockedPages(UserVa, PMdl);
+
+	MmFreePagesFromMdl(PMdl);
+
+	IoFreeMdl(PMdl);
+
+}

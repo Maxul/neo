@@ -1,0 +1,82 @@
+list win
+
+枚举所有窗口，分为两类：带框和不带框的，后者是前者的附属窗口，需要获取相对前者的偏移坐标。
+
+is_alive
+确定该窗口依然存在。
+
+针对每个新创立的窗口，我们会创建一个对应线程去监听。算法如下：
+扫描所有新窗口，加入队列
+遍历队列，逐个创立线程
+在线程内部，注册监听事件
+
+在成功注册事件之前，窗口随时可能关闭。这样会导致无法及时得知其关闭的事件，而没有从队列中清理掉。
+针对这个情况，我们分类讨论：
+可能在遍历到创立线程之间关闭，也可能在创立好线程到注册事件之间消失。
+所以要及时查看窗口是否还存在。
+
+可能在检索是否存在时候窗口存在，所以返回正常。但随即窗口消失，因此XGetImage会导致BadMatch (invalid parameter attributes)错误。我们根据这个错误把线程关闭。
+
+BadWindow (invalid Window parameter)
+
+#0  bad_window_handler (dsp=0x604070, err=0x7fffffffda20) at main.c:25
+#1  0x00007ffff7adec4d in _XError ()
+   from /usr/lib/x86_64-linux-gnu/libX11.so.6
+#2  0x00007ffff7adbad7 in ?? () from /usr/lib/x86_64-linux-gnu/libX11.so.6
+#3  0x00007ffff7adcc58 in _XReply ()
+   from /usr/lib/x86_64-linux-gnu/libX11.so.6
+#4  0x00007ffff7ac2afd in XGetWindowProperty ()
+   from /usr/lib/x86_64-linux-gnu/libX11.so.6
+#5  0x00007ffff7abd3c6 in XFetchName ()
+   from /usr/lib/x86_64-linux-gnu/libX11.so.6
+#6  0x0000000000401d09 in list_pop_windows (dpy=0x604070, w=213)
+    at listwin.c:139
+#7  0x0000000000401a62 in enum_new_windows (disp=0x604070) at listwin.c:26
+#8  0x00000000004024d3 in main (argc=1, argv=0x7fffffffdfa8) at main.c:63
+
+XQueryTree得到所有存在的id，但后来窗口消失，导致无法获取名称。
+
+注意：
+每次申请的空间要及时归还给系统，否则会收到
+Program terminated with signal SIGKILL, Killed
+的错误。通常原因如下：
+There are situations under which the kernel will send SIGKILL to a
+process. Others have mentioned the Linux OOM killer; a more rarely
+seen one is if you have a CPU-time resource hard limit set (such as
+via the ulimit shell-builtin) then the kernel will send the process a
+SIGKILL when the limit is reached.
+
+在下列几种情况下，系统会发送SIGKILL信号：
+
+1、OOM killer。out of memory 一般由于程序内存泄漏导致内存不足引起的。
+
+2、CPU-time resource hard limit。用ulimit -t 查看系统对CPU使用时间有没有限制。如果超过限制，就会发送SIGKILL信号。
+
+3、ptrace()
+Another fairly 'standard' case is when the process tracing another
+process using ptrace() dies without stopping the tracing; the traced
+process is sent a SIGKILL then. Since the process in this case is
+being actively traced with gdb, that would apparently not apply here,
+but it does explain why killing gdb will kill a process that gdb is
+attached to.
+
+其他可能的情况：
+-bad memory hardware (usually results in SIGSEGVs, but it looks like there are cases where SIGKILL will be generated)
+
+内存硬件错误。通常会导致SIGSEGV，有时候也会发送SIGKILL。
+
+- network or pseudo filesystem being ripped out from under the process
+
+- hit the SysReq key
+
+- various "secure computing" setups which restrict the operations a process can use
+由于安全设置限制了进程的使用。
+
+XFree
+regfree
+
+receive_cmd可以是一个线程也可以融合在某个线程中。作为线程不断轮询代价有些昂贵。这个命令主要用来打开窗口。一般应该在遍历窗口前进行。所以不是线程会更好一些。
+
+对于每一个窗口，都存在一个线程与之对应。它们的窗口都会不时更新。
+而对于事件，我们认为一次最多只有一个窗口会响应事件。所以只要一个就够了。
+
