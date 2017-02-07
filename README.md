@@ -2,7 +2,7 @@ AUTHOR: Maxul Lee
 
 Last update: 2017/1/11 9:00:00
 
-vmOS 是一款部署在PC上的安全架构。
+neo OS 是一款部署在PC上的安全架构。
 
 设计说明：
 
@@ -14,7 +14,7 @@ vmOS 是一款部署在PC上的安全架构。
 6. 提供安全、高效（轻量级）的客户平台。
 
 实现说明：
-目前vmOS运行在Linux宿主系统上（内核版本要求2.0以上）。支持Windows和Linux的应用。
+目前neo OS运行在Linux宿主系统上（内核版本要求2.0以上）。支持Windows和Linux的应用。
 未来将支持Windows宿主系统。
 
 硬件要求：x86-64平台，CPU支持Intel-VT。
