@@ -2,7 +2,7 @@
 
 Last update: 2017/1/11 9:00:00
 
-<p align="center"><img src="neo-demo.png" /></p>
+<p align="center"><img src="neo-demo.png" height="360" /></p>
 
 neo OS 是一款部署在PC上的安全架构。
 
