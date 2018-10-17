@@ -34,4 +34,5 @@ x86-64平台，CPU支持Intel-VT。
 1. [vmOS: A virtualization-based, secure desktop system](https://doi.org/10.1016/j.cose.2016.10.008), published in *Elsevier Computers & Security (CompSec'17)*. <br />
 
 # Contact
-AUTHOR: Maxul Lee (lmy2010lmy@gmail.com)
+1. Hongliang Liang (hliang@bupt.edu.cn)
+2. Maxul Lee (lmy2010lmy@gmail.com)
